@@ -55,6 +55,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /favicon.ico", s.handleFavicon)
 	mux.Handle("GET /v1/models", s.v1Auth(http.HandlerFunc(s.handleModels)))
 	mux.Handle("POST /v1/chat/completions", s.v1Auth(http.HandlerFunc(s.handleChat)))
+	// Responses API：由 chat/completions 桥接而来（见 responses.go）。
+	mux.Handle("POST /v1/responses", s.v1Auth(http.HandlerFunc(s.handleResponses)))
+	mux.Handle("GET /v1/responses/{id}", s.v1Auth(http.HandlerFunc(s.handleResponsesObject)))
+	mux.Handle("DELETE /v1/responses/{id}", s.v1Auth(http.HandlerFunc(s.handleResponsesObject)))
+	mux.Handle("POST /v1/responses/{id}/cancel", s.v1Auth(http.HandlerFunc(s.handleResponsesObject)))
 	mux.Handle("GET /admin", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
 	mux.Handle("GET /admin/", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
 	mux.Handle("GET /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
