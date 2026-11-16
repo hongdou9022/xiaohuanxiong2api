@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"net/http"
 	"strings"
@@ -25,6 +26,11 @@ type Server struct {
 	checkin *checkin.Service
 	login   *loginManager
 
+	// slots 是对上游的并发闸门：容量 = accounts.max_concurrent。
+	// 上游对单账号有频率限制（429 user_model_rate_limited），Qoder 这类客户端会并行发请求，
+	// 不设闸门就容易被限流；设了闸门超出的请求排队等待，而不是直接撞 429。
+	slots chan struct{}
+
 	startedAt time.Time
 	version   string
 }
@@ -39,9 +45,42 @@ func New(cfg *config.Config, client *upstream.Client, accountPool *pool.Pool, ca
 		logs:      NewLogBuffer(cfg.Log.BufferSizeValue()),
 		logger:    logger,
 		login:     newLoginManager(),
+		slots:     make(chan struct{}, cfg.Accounts.MaxConcurrentValue()),
 		startedAt: time.Now(),
 		version:   ver,
 	}
+}
+
+// acquireSlot 占用一个上游并发槽；ctx 取消时返回 false。
+func (s *Server) acquireSlot(ctx context.Context) bool {
+	if s.slots == nil {
+		return true
+	}
+	select {
+	case s.slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// releaseSlot 归还并发槽（防御性：空槽时不阻塞）。
+func (s *Server) releaseSlot() {
+	if s.slots == nil {
+		return
+	}
+	select {
+	case <-s.slots:
+	default:
+	}
+}
+
+// slotUsage 返回当前在途数与容量，用于日志。
+func (s *Server) slotUsage() (int, int) {
+	if s.slots == nil {
+		return 0, 0
+	}
+	return len(s.slots), cap(s.slots)
 }
 
 // SetCheckin 注入每日签到服务（供 /admin/api/checkin 使用）。

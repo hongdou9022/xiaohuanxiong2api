@@ -128,6 +128,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	lastStatus := 0
 	var lastErr apiError
 	attempted := false
+	rateRetries := 0
+	const maxRateRetries = 2
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		account := s.pool.Pick(tried)
@@ -146,8 +148,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			lastStatus = http.StatusBadGateway
 			continue
 		}
+		// 并发闸门：超出 accounts.max_concurrent 的请求在这里排队，
+		// 避免瞬时并发触发上游 429 user_model_rate_limited。
+		if !s.acquireSlot(ctx) {
+			lastErr = apiError{Message: "客户端在排队等待上游并发槽时取消了请求", Type: typeUpstream, Code: "client_canceled"}
+			lastStatus = http.StatusRequestTimeout
+			break
+		}
 		resp, err := s.sendChat(ctx, token, upstreamBody, stream)
 		if err != nil {
+			s.releaseSlot()
 			lastErr = apiError{Message: "转发上游失败：" + err.Error(), Type: typeUpstream, Code: "upstream_network"}
 			lastStatus = http.StatusBadGateway
 			continue
@@ -158,6 +168,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			_ = resp.Body.Close()
 			token, err = s.pool.Token(ctx, account.ID, true)
 			if err != nil {
+				s.releaseSlot()
 				s.pool.MarkError(account.ID, err.Error())
 				s.logger.Warnf("[chat] 账号 %s 强制刷新失败：%v", account.ID, err)
 				lastErr = apiError{Message: "账号 " + account.ID + " 强制刷新失败：" + err.Error(), Type: typeUpstream, Code: "token_refresh_failed"}
@@ -166,6 +177,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 			resp, err = s.sendChat(ctx, token, upstreamBody, stream)
 			if err != nil {
+				s.releaseSlot()
 				lastErr = apiError{Message: "转发上游失败：" + err.Error(), Type: typeUpstream, Code: "upstream_network"}
 				lastStatus = http.StatusBadGateway
 				continue
@@ -179,28 +191,51 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			} else {
 				s.forwardJSON(w, resp, &entry, resolvedClient)
 			}
+			s.releaseSlot()
 			return
 		case resp.StatusCode == http.StatusUnauthorized:
 			errBody := readErrorBody(resp)
+			s.releaseSlot()
 			s.pool.MarkError(account.ID, "上游返回 401")
 			lastErr = buildUpstreamError(http.StatusUnauthorized, errBody)
 			lastStatus = http.StatusBadGateway
 			continue
 		case resp.StatusCode == http.StatusTooManyRequests:
-			_ = resp.Body.Close()
-			s.pool.Cooldown(account.ID)
-			s.logger.Warnf("[chat] 账号 %s 收到 429，进入冷却 %s", account.ID, s.cfg.Accounts.Cooldown())
-			lastErr = buildUpstreamError(http.StatusTooManyRequests, nil)
+			// 429 有两种含义，处理方式不同：
+			//   1) 上游频率限流（user_model_rate_limited）：瞬时性的，先短退避重试，不要一上来就把唯一账号封 10 分钟；
+			//   2) 其它 429（含额度类）：重试无意义，冷却账号并换号。
+			errBody := readErrorBody(resp)
+			upErr := buildUpstreamError(http.StatusTooManyRequests, errBody)
+			inUse, capacity := s.slotUsage()
+			s.logger.Warnf("[chat] 账号 %s 收到 429（message=%q body=%s），在途并发 %d/%d",
+				account.ID, upErr.Message, truncateForLog(errBody, 160), inUse, capacity)
+			lastErr = upErr
 			lastStatus = http.StatusTooManyRequests
+			s.releaseSlot()
+			if rateRetries < maxRateRetries && ctx.Err() == nil {
+				rateRetries++
+				backoff := time.Duration(300*(1<<(rateRetries-1)) * time.Millisecond)
+				s.logger.Warnf("[chat] 429 短退避后重试（第 %d/%d 次，等待 %s）", rateRetries, maxRateRetries, backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+				}
+				attempt-- // 这次短退避重试不占用换号次数
+				continue
+			}
+			s.pool.Cooldown(account.ID)
+			s.logger.Warnf("[chat] 账号 %s 连续 429，进入冷却 %s", account.ID, s.cfg.Accounts.Cooldown())
 			continue
 		case resp.StatusCode >= 500:
 			errBody := readErrorBody(resp)
+			s.releaseSlot()
 			lastErr = buildUpstreamError(resp.StatusCode, errBody)
 			lastStatus = http.StatusBadGateway
 			continue
 		default:
 			// 其它 4xx：不换号，原样透传状态码与上游 message（SPEC §5.4）。
 			errBody := readErrorBody(resp)
+			s.releaseSlot()
 			upErr := buildUpstreamError(resp.StatusCode, errBody)
 			entry.Status = resp.StatusCode
 			entry.Error = upErr.Message
@@ -256,6 +291,15 @@ func readErrorBody(resp *http.Response) []byte {
 	return data
 }
 
+// truncateForLog 把错误体截成适合写进日志的一行（去换行、限长）。
+func truncateForLog(body []byte, max int) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
+}
+
 // buildUpstreamError 把上游错误体转成错误信封（含状态码与上游 message/code）。
 func buildUpstreamError(status int, body []byte) apiError {
 	message := "上游返回 " + strconv.Itoa(status)
@@ -263,11 +307,21 @@ func buildUpstreamError(status int, body []byte) apiError {
 		Code    *int   `json:"code"`
 		Message string `json:"message"`
 		Details string `json:"details"`
+		// 上游 429 用的是 OpenAI 风格嵌套信封：
+		// {"error":{"code":"user_model_rate_limited","message":"…","type":"rate_limit_error"}}
+		Error struct {
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+			Type    string          `json:"type"`
+		} `json:"error"`
 	}
 	if len(body) > 0 {
 		_ = json.Unmarshal(body, &payload)
 	}
 	detail := payload.Message
+	if detail == "" {
+		detail = payload.Error.Message
+	}
 	if detail == "" {
 		detail = payload.Details
 	}

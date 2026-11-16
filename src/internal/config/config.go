@@ -41,6 +41,7 @@ const (
 	DefaultRefreshMarginSeconds   = 300
 	DefaultCooldownSeconds        = 600
 	DefaultMaxAttempts            = 3
+	DefaultMaxConcurrent          = 3
 	DefaultRefreshOn401           = true
 	DefaultModel                  = "sn-glm-5-3-flash"
 	DefaultValidate               = "catalog"
@@ -109,6 +110,7 @@ type AccountsConfig struct {
 	RefreshMarginSeconds *int    `json:"refresh_margin_seconds"`
 	CooldownSeconds      *int    `json:"cooldown_seconds"`
 	MaxAttempts          *int    `json:"max_attempts"`
+	MaxConcurrent        *int    `json:"max_concurrent"`
 	RefreshOn401         *bool   `json:"refresh_on_401"`
 }
 
@@ -248,6 +250,7 @@ func (c *Config) applyDefaults() {
 	a.RefreshMarginSeconds = intPtr(a.RefreshMarginSeconds, DefaultRefreshMarginSeconds)
 	a.CooldownSeconds = intPtr(a.CooldownSeconds, DefaultCooldownSeconds)
 	a.MaxAttempts = intPtr(a.MaxAttempts, DefaultMaxAttempts)
+	a.MaxConcurrent = intPtr(a.MaxConcurrent, DefaultMaxConcurrent)
 	a.RefreshOn401 = boolPtr(a.RefreshOn401, DefaultRefreshOn401)
 	m := &c.Models
 	m.Default = strPtr(m.Default, DefaultModel)
@@ -344,6 +347,7 @@ func (c *Config) Validate() error {
 		{"upstream.bills_timeout_seconds", *c.Upstream.BillsTimeoutSeconds},
 		{"accounts.refresh_margin_seconds", *c.Accounts.RefreshMarginSeconds},
 		{"accounts.cooldown_seconds", *c.Accounts.CooldownSeconds},
+		{"accounts.max_concurrent", *c.Accounts.MaxConcurrent},
 		{"models.catalog_cache_seconds", *c.Models.CatalogCacheSeconds},
 		{"log.buffer_size", *c.Log.BufferSize},
 		{"checkin.retry_interval_minutes", *c.Checkin.RetryIntervalMinutes},
@@ -358,6 +362,9 @@ func (c *Config) Validate() error {
 	}
 	if *c.Accounts.MaxAttempts < 1 {
 		return fmt.Errorf("accounts.max_attempts 必须 >= 1（当前 %d）", *c.Accounts.MaxAttempts)
+	}
+	if *c.Accounts.MaxConcurrent < 1 {
+		return fmt.Errorf("accounts.max_concurrent 必须 >= 1（当前 %d）", *c.Accounts.MaxConcurrent)
 	}
 	if *c.Checkin.BillsLimit < 1 {
 		return fmt.Errorf("checkin.bills_limit 必须 >= 1（当前 %d）", *c.Checkin.BillsLimit)
@@ -587,6 +594,11 @@ func (a *AccountsConfig) Cooldown() time.Duration {
 
 // MaxAttemptsValue 返回单次请求最多尝试账号数。
 func (a *AccountsConfig) MaxAttemptsValue() int { return derefInt(a.MaxAttempts, DefaultMaxAttempts) }
+
+// MaxConcurrentValue 返回对上游的最大并发数（超出则排队）。
+func (a *AccountsConfig) MaxConcurrentValue() int {
+	return derefInt(a.MaxConcurrent, DefaultMaxConcurrent)
+}
 
 // RefreshOn401Value 返回 401 是否强制刷新重试。
 func (a *AccountsConfig) RefreshOn401Value() bool {
