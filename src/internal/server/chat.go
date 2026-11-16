@@ -139,6 +139,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		attempted = true
 		tried[account.ID] = true
 		entry.Account = account.ID
+		// 该「账号+模型」组合仍在冷却中就直接跳过：只挡这一个模型，
+		// 不影响同一账号的其它模型（否则一个热门模型被限流，整台机器都不可用）。
+		if rem := s.modelCooldownRemaining(account.ID, upstreamModel); rem > 0 {
+			lastStatus = http.StatusTooManyRequests
+			lastErr = apiError{
+				Message: "模型 " + upstreamModel + " 在该账号上被上游限流，约 " + strconv.Itoa(int(rem.Seconds()+0.5)) + " 秒后可重试；换用其它模型不受影响",
+				Type:    typeRateLimit,
+				Code:    "model_rate_limited",
+			}
+			s.logger.Warnf("[chat] 跳过账号 %s：模型 %s 仍在冷却（剩余 %s）", account.ID, upstreamModel, rem.Round(time.Second))
+			continue
+		}
 		s.logger.Debugf("[chat] 选到账号 %s（第 %d 次尝试，model=%s）", account.ID, attempt+1, upstreamModel)
 
 		token, err := s.pool.Token(ctx, account.ID, false)
@@ -212,6 +224,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			lastErr = upErr
 			lastStatus = http.StatusTooManyRequests
 			s.releaseSlot()
+			// 上游 429 分两类，绝不能一律封账号：
+			//   1) user_model_rate_limited —— 按「账号+模型」限流，只冷却这一个模型；
+			//   2) 其它 429（额度类等）—— 短退避重试，仍失败才冷却整个账号。
+			if isModelScopedRateLimit(errBody) {
+				cd := s.setModelCooldown(account.ID, upstreamModel)
+				upErr.Message = "模型 " + upstreamModel + " 被上游限流（" + upErr.Message + "），该模型冷却 " + strconv.Itoa(int(cd.Seconds())) + " 秒；其它模型不受影响"
+				lastErr = upErr
+				s.logger.Warnf("[chat] 模型 %s 在账号 %s 上被限流，仅冷却该模型 %s", upstreamModel, account.ID, cd)
+				continue
+			}
 			if rateRetries < maxRateRetries && ctx.Err() == nil {
 				rateRetries++
 				backoff := time.Duration(300*(1<<(rateRetries-1)) * time.Millisecond)
@@ -341,6 +363,25 @@ func buildUpstreamError(status int, body []byte) apiError {
 		err.UpstreamCode = payload.Code
 	}
 	return err
+}
+
+// isModelScopedRateLimit 判断 429 是否只针对某个模型。
+// 上游报文形如 {"error":{"code":"user_model_rate_limited","message":"您的模型请求频率超限，请稍后重试"}}，
+// code 里带 model 说明限制挂在「账号+模型」上，不应该把整个账号冷却。
+func isModelScopedRateLimit(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	var payload struct {
+		Error struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	code := strings.ToLower(strings.Trim(strings.TrimSpace(string(payload.Error.Code)), `"`))
+	return strings.Contains(code, "model")
 }
 
 // usageInfo 对应上游的 usage 字段。

@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"xhx2api/internal/checkin"
@@ -31,6 +32,13 @@ type Server struct {
 	// 不设闸门就容易被限流；设了闸门超出的请求排队等待，而不是直接撞 429。
 	slots chan struct{}
 
+	// modelCool 是「账号 + 模型」维度的冷却表。
+	// 上游的 429 报文是 user_model_rate_limited —— 限制挂在「某个账号的某个模型」上，
+	// 所以只冷却这一个组合，不能像 5xx 那样把整个账号封掉（否则一个热门模型被限流，
+	// 其它模型跟着一起不可用，表现为「整台机器被锁 60 秒」）。
+	modelCoolMu sync.Mutex
+	modelCool   map[string]time.Time
+
 	startedAt time.Time
 	version   string
 }
@@ -46,9 +54,49 @@ func New(cfg *config.Config, client *upstream.Client, accountPool *pool.Pool, ca
 		logger:    logger,
 		login:     newLoginManager(),
 		slots:     make(chan struct{}, cfg.Accounts.MaxConcurrentValue()),
+		modelCool: make(map[string]time.Time),
 		startedAt: time.Now(),
 		version:   ver,
 	}
+}
+
+// modelCoolKey 组合键：同一账号下不同模型互不影响。
+func modelCoolKey(accountID, model string) string {
+	return accountID + "\x00" + model
+}
+
+// modelCooldownRemaining 返回该「账号+模型」组合剩余的冷却时长（0 = 未冷却）。
+func (s *Server) modelCooldownRemaining(accountID, model string) time.Duration {
+	if s.modelCool == nil {
+		return 0
+	}
+	s.modelCoolMu.Lock()
+	defer s.modelCoolMu.Unlock()
+	until, ok := s.modelCool[modelCoolKey(accountID, model)]
+	if !ok {
+		return 0
+	}
+	rem := time.Until(until)
+	if rem <= 0 {
+		delete(s.modelCool, modelCoolKey(accountID, model))
+		return 0
+	}
+	return rem
+}
+
+// setModelCooldown 只冷却这一个「账号+模型」组合。
+func (s *Server) setModelCooldown(accountID, model string) time.Duration {
+	d := s.cfg.Accounts.Cooldown()
+	if d <= 0 {
+		d = time.Minute
+	}
+	s.modelCoolMu.Lock()
+	if s.modelCool == nil {
+		s.modelCool = make(map[string]time.Time)
+	}
+	s.modelCool[modelCoolKey(accountID, model)] = time.Now().Add(d)
+	s.modelCoolMu.Unlock()
+	return d
 }
 
 // acquireSlot 占用一个上游并发槽；ctx 取消时返回 false。
